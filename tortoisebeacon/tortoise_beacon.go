@@ -12,7 +12,6 @@ import (
 	"github.com/ALTree/bigfloat"
 	"github.com/spacemeshos/go-spacemesh/common/types"
 	"github.com/spacemeshos/go-spacemesh/common/util"
-	"github.com/spacemeshos/go-spacemesh/database"
 	"github.com/spacemeshos/go-spacemesh/log"
 	"github.com/spacemeshos/go-spacemesh/p2p/service"
 	"github.com/spacemeshos/go-spacemesh/signing"
@@ -39,11 +38,6 @@ type broadcaster interface {
 	Broadcast(ctx context.Context, channel string, data []byte) error
 }
 
-type tortoiseBeaconDB interface {
-	GetTortoiseBeacon(epochID types.EpochID) (types.Hash32, error)
-	SetTortoiseBeacon(epochID types.EpochID, beacon types.Hash32) error
-}
-
 //go:generate mockgen -package=mocks -destination=./mocks/mocks.go -source=./tortoise_beacon.go
 
 type coin interface {
@@ -60,8 +54,12 @@ type eligibilityChecker interface {
 }
 
 type (
-	proposals = struct{ valid, potentiallyValid [][]byte }
-	allVotes  = struct{ valid, invalid proposalSet }
+	proposals   = struct{ valid, potentiallyValid [][]byte }
+	allVotes    = struct{ valid, invalid proposalSet }
+	epochBeacon = struct {
+		weight uint64
+		blocks map[types.BlockID]struct{}
+	}
 )
 
 type layerClock interface {
@@ -81,7 +79,6 @@ func New(
 	nodeID types.NodeID,
 	net broadcaster,
 	atxDB activationDB,
-	tortoiseBeaconDB tortoiseBeaconDB,
 	edSigner signing.Signer,
 	edVerifier signing.VerifyExtractor,
 	vrfSigner signing.Signer,
@@ -96,7 +93,6 @@ func New(
 		nodeID:                  nodeID,
 		net:                     net,
 		atxDB:                   atxDB,
-		tortoiseBeaconDB:        tortoiseBeaconDB,
 		edSigner:                edSigner,
 		edVerifier:              edVerifier,
 		vrfSigner:               vrfSigner,
@@ -104,6 +100,7 @@ func New(
 		weakCoin:                weakCoin,
 		clock:                   clock,
 		beacons:                 make(map[types.EpochID]types.Hash32),
+		beaconsFromBlocks:       make(map[types.EpochID]map[string]*epochBeacon),
 		hasProposed:             make(map[string]struct{}),
 		hasVoted:                make([]map[string]struct{}, conf.RoundsNumber),
 		firstRoundIncomingVotes: make(map[string]proposals),
@@ -121,17 +118,16 @@ type TortoiseBeacon struct {
 
 	logger log.Log
 
-	config           Config
-	nodeID           types.NodeID
-	sync             SyncState
-	net              broadcaster
-	atxDB            activationDB
-	tortoiseBeaconDB tortoiseBeaconDB
-	edSigner         signing.Signer
-	edVerifier       signing.VerifyExtractor
-	vrfSigner        signing.Signer
-	vrfVerifier      signing.Verifier
-	weakCoin         coin
+	config      Config
+	nodeID      types.NodeID
+	sync        SyncState
+	net         broadcaster
+	atxDB       activationDB
+	edSigner    signing.Signer
+	edVerifier  signing.VerifyExtractor
+	vrfSigner   signing.Signer
+	vrfVerifier signing.Verifier
+	weakCoin    coin
 
 	clock       layerClock
 	layerTicker chan types.LayerID
@@ -148,9 +144,11 @@ type TortoiseBeacon struct {
 	hasProposed               map[string]struct{}
 	hasVoted                  []map[string]struct{}
 	proposalPhaseFinishedTime time.Time
-	beacons                   map[types.EpochID]types.Hash32
-	proposalChans             map[types.EpochID]chan *proposalMessageWithReceiptData
-	proposalChecker           eligibilityChecker
+	// TODO: only keep a buffer of epochs
+	beacons           map[types.EpochID]types.Hash32
+	beaconsFromBlocks map[types.EpochID]map[string]*epochBeacon
+	proposalChans     map[types.EpochID]chan *proposalMessageWithReceiptData
+	proposalChecker   eligibilityChecker
 }
 
 // SetSyncState updates sync state provider. Must be executed only once.
@@ -206,6 +204,88 @@ func (tb *TortoiseBeacon) isClosed() bool {
 	return atomic.LoadUint64(&tb.running) == 0
 }
 
+// ReportBeaconFromBlock reports the beacon value in a block along with the miner's weight unit.
+func (tb *TortoiseBeacon) ReportBeaconFromBlock(epoch types.EpochID, blockID types.BlockID, beacon []byte, weight uint64) {
+	tb.recordBlockBeacon(epoch, blockID, beacon, weight)
+
+	if _, err := tb.GetBeacon(epoch); err == nil {
+		// already has beacon. i.e. we had participated in tortoise beacon protocol during last epoch
+		return
+	}
+
+	if epochBeacon := tb.findMostWeightedBeaconBeaconForEpoch(epoch); epochBeacon != nil {
+		tb.setBeacon(epoch-1, types.BytesToHash(epochBeacon))
+	}
+}
+
+func (tb *TortoiseBeacon) recordBlockBeacon(epochID types.EpochID, blockID types.BlockID, beacon []byte, weight uint64) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+
+	if _, ok := tb.beaconsFromBlocks[epochID]; !ok {
+		tb.beaconsFromBlocks[epochID] = make(map[string]*epochBeacon)
+	}
+	key := string(beacon)
+	entry, ok := tb.beaconsFromBlocks[epochID][key]
+	if !ok {
+		tb.beaconsFromBlocks[epochID][key] = &epochBeacon{
+			weight: weight,
+			blocks: map[types.BlockID]struct{}{blockID: {}},
+		}
+		tb.logger.With().Debug("added beacon from block",
+			epochID,
+			blockID,
+			log.String("beacon", types.BytesToHash(beacon).ShortString()),
+			log.Uint64("weight", weight))
+		return
+	}
+
+	// checks if we have recorded this blockID before
+	if _, ok := entry.blocks[blockID]; ok {
+		tb.logger.With().Warning("block already reported beacon", epochID, blockID)
+		return
+	}
+
+	entry.blocks[blockID] = struct{}{}
+	entry.weight += weight
+	tb.logger.With().Debug("added beacon from block",
+		epochID,
+		blockID,
+		log.String("beacon", types.BytesToHash(beacon).ShortString()),
+		log.Uint64("weight", weight))
+}
+
+func (tb *TortoiseBeacon) findMostWeightedBeaconBeaconForEpoch(epoch types.EpochID) []byte {
+	tb.mu.RLock()
+	defer tb.mu.RUnlock()
+	epochBeacons, ok := tb.beaconsFromBlocks[epoch]
+	if !ok {
+		return nil
+	}
+	var mostWeight uint64
+	var beacon []byte
+	numBlocks := 0
+	for k, v := range epochBeacons {
+		if v.weight > mostWeight {
+			beacon = []byte(k)
+			mostWeight = v.weight
+		}
+		numBlocks += len(v.blocks)
+	}
+
+	logger := tb.logger.WithFields(epoch, log.Int("num_blocks", numBlocks))
+
+	if uint32(numBlocks) < tb.config.BeaconSyncNumBlocks {
+		logger.Debug("not enough blocks to determine beacon")
+		return nil
+	}
+
+	logger.With().Info("beacon determined for epoch",
+		log.String("beacon", types.BytesToHash(beacon).ShortString()),
+		log.Uint64("weight", mostWeight))
+	return beacon
+}
+
 // GetBeacon returns a Tortoise Beacon value as []byte for a certain epoch or an error if it doesn't exist.
 // TODO(nkryuchkov): consider not using (using DB instead)
 func (tb *TortoiseBeacon) GetBeacon(epochID types.EpochID) ([]byte, error) {
@@ -213,32 +293,19 @@ func (tb *TortoiseBeacon) GetBeacon(epochID types.EpochID) ([]byte, error) {
 		return nil, ErrZeroEpoch
 	}
 
-	if tb.tortoiseBeaconDB != nil {
-		val, err := tb.tortoiseBeaconDB.GetTortoiseBeacon(epochID - 1)
-		if err == nil {
-			return val.Bytes(), nil
-		}
-
-		if !errors.Is(err, database.ErrNotFound) {
-			tb.logger.Error("failed to get tortoise beacon for epoch %v from DB: %v", epochID-1, err)
-
-			return nil, fmt.Errorf("get beacon from DB: %w", err)
-		}
-	}
-
-	if (epochID - 1).IsGenesis() {
+	beaconEpoch := epochID - 1
+	if beaconEpoch.IsGenesis() {
 		return types.HexToHash32(genesisBeacon).Bytes(), nil
 	}
 
 	tb.mu.RLock()
 	defer tb.mu.RUnlock()
 
-	beacon, ok := tb.beacons[epochID-1]
+	beacon, ok := tb.beacons[beaconEpoch]
 	if !ok {
-		tb.logger.With().Error("beacon is not calculated",
-			log.Uint32("target_epoch", uint32(epochID)),
-			log.Uint32("beacon_epoch", uint32(epochID-1)))
-
+		tb.logger.With().Warning("beacon is not calculated",
+			epochID,
+			log.Uint32("beacon_epoch", uint32(beaconEpoch)))
 		return nil, ErrBeaconNotCalculated
 	}
 
@@ -247,22 +314,18 @@ func (tb *TortoiseBeacon) GetBeacon(epochID types.EpochID) ([]byte, error) {
 
 func (tb *TortoiseBeacon) setBeacon(epoch types.EpochID, beacon types.Hash32) {
 	tb.mu.Lock()
+	defer tb.mu.Unlock()
 	tb.beacons[epoch] = beacon
-	tb.mu.Unlock()
+	tb.logger.With().Info("beacon set for epoch", epoch, log.String("beacon", beacon.ShortString()))
 }
 
 func (tb *TortoiseBeacon) initGenesisBeacons() {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
 	for epoch := types.EpochID(0); epoch.IsGenesis(); epoch++ {
 		genesis := types.HexToHash32(genesisBeacon)
+		tb.logger.With().Error("beacon set for epoch", epoch, log.String("beacon", genesis.ShortString()))
 		tb.beacons[epoch] = genesis
-
-		if tb.tortoiseBeaconDB != nil {
-			if err := tb.tortoiseBeaconDB.SetTortoiseBeacon(epoch, genesis); err != nil {
-				tb.logger.With().Error("failed to write tortoise beacon to DB",
-					log.Uint32("epoch_id", uint32(epoch)),
-					log.String("beacon", genesis.String()))
-			}
-		}
 	}
 }
 
@@ -322,7 +385,7 @@ func (tb *TortoiseBeacon) listenLayers(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case layer := <-tb.layerTicker:
-			tb.logger.With().Debug("received tick", layer)
+			tb.logger.With().Info("received tick", layer)
 			tb.eg.Go(func() error {
 				tb.handleLayer(ctx, layer)
 				return nil
@@ -372,12 +435,14 @@ func (tb *TortoiseBeacon) handleEpoch(ctx context.Context, epoch types.EpochID) 
 	}
 
 	// make sure this node has ATX in the last epoch and is eligible to participate in tortoise beacon
-	if _, err := tb.atxDB.GetNodeAtxIDForEpoch(tb.nodeID, epoch-1); err != nil {
-		logger.Info("node has no ATX in last epoch, not participating in tortoise beacon")
+	atxID, err := tb.atxDB.GetNodeAtxIDForEpoch(tb.nodeID, epoch-1)
+	if err != nil {
+		logger.With().Info("node has no ATX in last epoch, not participating in tortoise beacon", log.Err(err))
 		return
 	}
 
-	logger.Info("handling epoch")
+	logger.With().Info("participating in tortoise beacon protocol with ATX", atxID)
+
 	epochWeight, atxs, err := tb.atxDB.GetEpochWeight(epoch)
 	if err != nil {
 		logger.With().Error("failed to get weight targeting epoch", log.Err(err))

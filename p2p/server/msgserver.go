@@ -51,6 +51,7 @@ type requestSnapshot struct {
 	timestamp time.Time
 }
 
+// responseHandlers is a set of callbacks used to handle responses from the server.
 type responseHandlers struct {
 	okCallback   func(msg []byte)
 	failCallBack func(err error)
@@ -129,6 +130,7 @@ func (p *MessageServer) Start(ctx context.Context) error {
 		})
 	}
 
+	// buffer the channel to 2 so no go routine gets stuck after exit
 	done := make(chan error, 2)
 
 	// Clean up stale messages concurrently. It will stop once the context is cancelled.
@@ -179,10 +181,10 @@ func (p *MessageServer) processIngressMessages(ctx context.Context) error {
 
 // cleanStaleMessages ticks some time after the requestLifetime config and looks at the
 // front of the pending queue for request snapshots that are past the max lifetime.
-// If a snapshot is found, the element is queued for removal from the queue and the
+// If a snapshot is found, the element is tagged for removal from the queue and the
 // request handler is notified via its fail callback. It returns when the context is cancelled.
 func (p *MessageServer) cleanStaleMessages(ctx context.Context) error {
-	ticker := time.NewTicker(p.requestLifetime * 100 * time.Millisecond)
+	ticker := time.NewTicker(p.requestLifetime + 100*time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -331,6 +333,7 @@ func (p *MessageServer) RegisterMsgHandler(msgType MessageType, reqHandler func(
 	p.msgRequestHandlersMu.Unlock()
 }
 
+// extractPayload extracts the payload from the message.
 func extractPayload(m Message) ([]byte, error) {
 	data, ok := m.Data().(*service.DataMsgWrapper)
 	if !ok {
@@ -339,6 +342,7 @@ func extractPayload(m Message) ([]byte, error) {
 	return data.Payload, nil
 }
 
+// handlerFromBytesHandler creates a handler from a function that takes a []byte and returns a []byte.
 func handlerFromBytesHandler(in func(context.Context, []byte) ([]byte, error)) func(context.Context, Message) ([]byte, error) {
 	return func(ctx context.Context, message Message) ([]byte, error) {
 		payload, err := extractPayload(message)
@@ -349,7 +353,8 @@ func handlerFromBytesHandler(in func(context.Context, []byte) ([]byte, error)) f
 	}
 }
 
-// RegisterBytesMsgHandler sets the handler to act on a specific message request.
+// RegisterBytesMsgHandler registers a handler that takes a byte slice as input
+// and returns a byte slice as output.
 func (p *MessageServer) RegisterBytesMsgHandler(msgType MessageType, reqHandler func(context.Context, []byte) ([]byte, error)) {
 	p.RegisterMsgHandler(msgType, handlerFromBytesHandler(reqHandler))
 }

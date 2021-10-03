@@ -387,7 +387,9 @@ func TestSwarm_MultipleMessagesFromMultipleSenders(t *testing.T) {
 	exchan1 := p1.RegisterDirectProtocol(exampleProtocol)
 	assert.Equal(t, exchan1, p1.directProtocolHandlers[exampleProtocol])
 
-	p1.Start(context.TODO())
+	if err := p1.Start(context.TODO()); err != nil {
+		t.Errorf("failed to start: %w", err)
+	}
 
 	pend := make(map[string]chan error)
 	var mu sync.Mutex
@@ -428,6 +430,7 @@ func TestSwarm_MultipleMessagesFromMultipleSenders(t *testing.T) {
 		res := <-c
 		require.NoError(t, res)
 	}
+
 	p1.Shutdown()
 	sa.clean()
 }

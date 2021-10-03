@@ -155,21 +155,27 @@ type MessageNetwork struct {
 	*server.MessageServer
 	peersProvider
 	log.Log
+	cancelServer func()
 }
 
 // Close closes the message network
 func (mn MessageNetwork) Close() {
-	mn.MessageServer.Close()
+	mn.cancelServer()
 	mn.peersProvider.Close()
 }
 
 // NewMessageNetwork creates a new instance of the fetch network server
 func NewMessageNetwork(ctx context.Context, requestTimeOut int, net service.Service, protocol string, log log.Log) *MessageNetwork {
-	return &MessageNetwork{
-		server.NewMsgServer(ctx, net.(server.Service), protocol, time.Duration(requestTimeOut)*time.Second, make(chan service.DirectMessage, p2pconf.Values.BufferSize), log),
-		peers.Start(net, peers.WithLog(log.WithName("peers"))),
-		log,
+	// TODO(josebalius): Refactor once we stop passing context into constructor and introduce a Start method to network
+	ctx, cancel := context.WithCancel(ctx)
+	mn := &MessageNetwork{
+		MessageServer: server.NewMsgServer(net.(server.Service), protocol, time.Duration(requestTimeOut)*time.Second, make(chan service.DirectMessage, p2pconf.Values.BufferSize), log),
+		peersProvider: peers.Start(net, peers.WithLog(log.WithName("peers"))),
+		Log:           log,
+		cancelServer:  cancel,
 	}
+	go mn.Start(ctx)
+	return mn
 }
 
 // GetRandomPeer returns a random peer from current peer list
@@ -205,6 +211,7 @@ type Fetch struct {
 	// activeBatches contains batches of requests in pendingRequests.
 	activeBatches        map[types.Hash32]batchInfo
 	net                  network
+	cancelNet            func()
 	requestReceiver      chan request
 	batchRequestReceiver chan []request
 	batchTimeout         *time.Ticker

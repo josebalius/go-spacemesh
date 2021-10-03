@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -46,11 +47,7 @@ func TestProtocol_ResponseHasError(t *testing.T) {
 func TestProtocol_SendRequest(t *testing.T) {
 	sim := service.NewSimulator()
 	n1 := sim.NewNode()
-	serv1 := NewMsgServer(context.TODO(), n1, protocol, 5*time.Second, make(chan service.DirectMessage, config.Values.BufferSize), logtest.New(t).WithName("serv1"))
-	t.Cleanup(func() {
-		serv1.Close()
-	})
-	//handler that returns some bytes on request
+	serv1 := NewMsgServer(n1, protocol, 5*time.Second, make(chan service.DirectMessage, config.Values.BufferSize), logtest.New(t).WithName("serv1"))
 
 	mockData := "some value to return"
 	handler := func(ctx context.Context, msg []byte) ([]byte, error) {
@@ -58,12 +55,12 @@ func TestProtocol_SendRequest(t *testing.T) {
 	}
 	// todo test nonbyte handlers
 	serv1.RegisterBytesMsgHandler(1, handler)
+	go serv1.Start(context.TODO())
 
 	n2 := sim.NewNode()
-	serv2 := NewMsgServer(context.TODO(), n2, protocol, 5*time.Second, make(chan service.DirectMessage, config.Values.BufferSize), logtest.New(t).WithName("serv2"))
-	t.Cleanup(func() {
-		serv2.Close()
-	})
+	serv2 := NewMsgServer(n2, protocol, 5*time.Second, make(chan service.DirectMessage, config.Values.BufferSize), logtest.New(t).WithName("serv2"))
+	go serv2.Start(context.TODO())
+
 	//send request with handler that converts to string and sends via channel
 	respCh := make(chan []byte)
 	callback := func(resp []byte) {
@@ -89,22 +86,19 @@ func TestProtocol_SendRequest(t *testing.T) {
 func TestProtocol_SendRequestPeerReturnError(t *testing.T) {
 	sim := service.NewSimulator()
 	n1 := sim.NewNode()
-	srv1 := NewMsgServer(context.TODO(), n1, protocol, 5*time.Second, make(chan service.DirectMessage, config.Values.BufferSize), logtest.New(t).WithName("serv1"))
-	t.Cleanup(func() {
-		srv1.Close()
-	})
+	srv1 := NewMsgServer(n1, protocol, 5*time.Second, make(chan service.DirectMessage, config.Values.BufferSize), logtest.New(t).WithName("serv1"))
 
 	// handler returns error
 	handler := func(ctx context.Context, msg []byte) ([]byte, error) {
 		return nil, ErrBadRequest
 	}
 	srv1.RegisterBytesMsgHandler(1, handler)
+	go srv1.Start(context.TODO())
 
 	n2 := sim.NewNode()
-	srv2 := NewMsgServer(context.TODO(), n2, protocol, 5*time.Second, make(chan service.DirectMessage, config.Values.BufferSize), logtest.New(t).WithName("serv2"))
-	t.Cleanup(func() {
-		srv2.Close()
-	})
+	srv2 := NewMsgServer(n2, protocol, 5*time.Second, make(chan service.DirectMessage, config.Values.BufferSize), logtest.New(t).WithName("serv2"))
+	go srv2.Start(context.TODO())
+
 	respCh := make(chan []byte)
 	callback := func(resp []byte) {
 		respCh <- resp
@@ -124,10 +118,8 @@ func TestProtocol_SendRequestPeerReturnError(t *testing.T) {
 func TestProtocol_CleanOldPendingMessages(t *testing.T) {
 	sim := service.NewSimulator()
 	n1 := sim.NewNode()
-	serv1 := NewMsgServer(context.TODO(), n1, protocol, 5*time.Second, make(chan service.DirectMessage, config.Values.BufferSize), logtest.New(t).WithName("serv1"))
-	t.Cleanup(func() {
-		serv1.Close()
-	})
+	serv1 := NewMsgServer(n1, protocol, 5*time.Second, make(chan service.DirectMessage, config.Values.BufferSize), logtest.New(t).WithName("serv1"))
+	go serv1.Start(context.TODO())
 	//handler that returns some bytes on request
 
 	handler := func(ctx context.Context, msg []byte) ([]byte, error) {
@@ -138,10 +130,9 @@ func TestProtocol_CleanOldPendingMessages(t *testing.T) {
 	serv1.RegisterBytesMsgHandler(1, handler)
 
 	n2 := sim.NewNode()
-	serv2 := NewMsgServer(context.TODO(), n2, protocol, 10*time.Millisecond, make(chan service.DirectMessage, config.Values.BufferSize), logtest.New(t).WithName("serv2"))
-	t.Cleanup(func() {
-		serv2.Close()
-	})
+	serv2 := NewMsgServer(n2, protocol, 10*time.Millisecond, make(chan service.DirectMessage, config.Values.BufferSize), logtest.New(t).WithName("serv2"))
+	go serv2.Start(context.TODO())
+
 	//send request with handler that converts to string and sends via channel
 	respCh := make(chan []byte)
 	callback := func(resp []byte) {
@@ -167,26 +158,49 @@ func TestProtocol_CleanOldPendingMessages(t *testing.T) {
 	}
 }
 
-func TestProtocol_Close(t *testing.T) {
+func TestProtocol_StartContextCancellation(t *testing.T) {
 	sim := service.NewSimulator()
 	n1 := sim.NewNode()
-	srv1 := NewMsgServer(context.TODO(), n1, protocol, 10*time.Millisecond, make(chan service.DirectMessage, config.Values.BufferSize), logtest.New(t).WithName("t5"))
-	t.Cleanup(srv1.Close)
-	srv1.RegisterBytesMsgHandler(1, func(ctx context.Context, msg []byte) ([]byte, error) {
-		time.Sleep(2 * time.Second)
-		return nil, nil
-	})
+	serv1 := NewMsgServer(n1, protocol, 5*time.Second, make(chan service.DirectMessage, config.Values.BufferSize), logtest.New(t).WithName("serv1"))
 
-	n2 := sim.NewNode()
-	srv2 := NewMsgServer(context.TODO(), n2, protocol, 10*time.Millisecond, make(chan service.DirectMessage, config.Values.BufferSize), logtest.New(t).WithName("t6"))
-	t.Cleanup(srv2.Close)
+	ctx, _ := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	var wg sync.WaitGroup
 
-	strCh := make(chan string, 1)
-	callback := func(msg []byte) {
-		strCh <- string(msg)
-	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 
-	err := srv2.SendRequest(context.TODO(), 1, nil, n1.PublicKey(), callback, func(err error) {})
-	assert.NoError(t, err, "Should not return error")
-	assert.EqualValues(t, 1, srv2.pendingQueue.Len(), "value received did not match correct value")
+		err := serv1.Start(ctx)
+		if err != context.DeadlineExceeded {
+			t.Errorf("expected deadline exceeded error, got: %v", err)
+		}
+	}()
+
+	wg.Wait()
+}
+
+func TestProtocol_StartClosedIngressFinish(t *testing.T) {
+	sim := service.NewSimulator()
+	n1 := sim.NewNode()
+	ingressCh := make(chan service.DirectMessage, config.Values.BufferSize)
+	serv1 := NewMsgServer(n1, protocol, 5*time.Second, ingressCh, logtest.New(t).WithName("serv1"))
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		err := serv1.Start(context.TODO())
+		if err != context.Canceled {
+			t.Errorf("expected context canceled error, got: %v", err)
+		}
+	}()
+
+	ticker := time.Tick(50 * time.Millisecond)
+
+	<-ticker
+	close(ingressCh)
+
+	wg.Wait()
 }

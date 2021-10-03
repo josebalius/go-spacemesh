@@ -130,7 +130,7 @@ func New(network Network, opts ...Option) *Sync {
 	}
 	sync.ctx, sync.cancel = context.WithCancel(sync.ctx)
 	sync.tg = taskgroup.New(taskgroup.WithContext(sync.ctx))
-	sync.srv = server.NewMsgServer(sync.ctx,
+	sync.srv = server.NewMsgServer(
 		network,
 		protocolName,
 		sync.config.RoundTimeout,
@@ -138,6 +138,7 @@ func New(network Network, opts ...Option) *Sync {
 		sync.log,
 	)
 	sync.srv.RegisterBytesMsgHandler(server.RequestTimeSync, sync.requestHandler)
+	go sync.srv.Start(sync.ctx) // TODO(josebalius): this method should take a context
 	return sync
 }
 
@@ -194,7 +195,6 @@ func (s *Sync) Stop() {
 		s.peersWatcher.Close()
 	}
 	s.Wait()
-	s.srv.Close()
 }
 
 // Wait will return first error that is returned by background workers.

@@ -24,6 +24,7 @@ type protocol struct {
 	table     protocolRoutingTable
 	logger    log.Log
 	msgServer *server.MessageServer
+	cancel    func() // TODO(josebalius): remove this once a Start method is implemented
 }
 
 func (p *protocol) SetLocalAddresses(tcp, udp int) {
@@ -42,22 +43,27 @@ const MessageTimeout = time.Second * 5 // TODO: Parametrize
 
 // newProtocol is a constructor for a protocol protocol provider.
 func newProtocol(ctx context.Context, local p2pcrypto.PublicKey, rt protocolRoutingTable, svc server.Service, log log.Log) *protocol {
-	s := server.NewMsgServer(ctx, svc, Name, MessageTimeout, make(chan service.DirectMessage, MessageBufSize), log)
+	ctx, cancel := context.WithCancel(ctx)
+
+	s := server.NewMsgServer(svc, Name, MessageTimeout, make(chan service.DirectMessage, MessageBufSize), log)
 	d := &protocol{
 		local:     &node.Info{ID: local.Array(), IP: net.IPv4zero, ProtocolPort: 7513, DiscoveryPort: 7513},
 		table:     rt,
 		msgServer: s,
 		logger:    log,
+		cancel:    cancel,
 	}
 
 	// XXX Reminder: for discovery protocol to work you must call SetLocalAddresses with updated ports from the socket.
 
 	d.msgServer.RegisterMsgHandler(server.PingPong, d.newPingRequestHandler())
 	d.msgServer.RegisterMsgHandler(server.GetAddresses, d.newGetAddressesRequestHandler())
+
+	go d.msgServer.Start(ctx) // TODO(josebalius): errors need to be handled
 	return d
 }
 
 // Close stops the message server protocol from serving requests.
 func (p *protocol) Close() {
-	p.msgServer.Close()
+	p.cancel()
 }

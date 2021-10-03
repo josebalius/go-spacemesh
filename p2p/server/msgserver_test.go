@@ -17,7 +17,8 @@ import (
 const protocol = "/protocol/test/1.0/"
 
 func TestProtocol_ResponseNoDataNoError(t *testing.T) {
-	data := SerializeResponse(nil, nil)
+	data, err := SerializeResponse(nil, nil)
+	assert.Nil(t, err)
 	assert.Greater(t, len(data), 0)
 	resp, err := deserializeResponse(data)
 	assert.NoError(t, err)
@@ -27,7 +28,8 @@ func TestProtocol_ResponseNoDataNoError(t *testing.T) {
 
 func TestProtocol_ResponseNoError(t *testing.T) {
 	bts := []byte("Baa Ram Ewe")
-	data := SerializeResponse(bts, nil)
+	data, err := SerializeResponse(bts, nil)
+	assert.Nil(t, err)
 	assert.Greater(t, len(data), 0)
 	resp, err := deserializeResponse(data)
 	assert.NoError(t, err)
@@ -36,7 +38,8 @@ func TestProtocol_ResponseNoError(t *testing.T) {
 }
 
 func TestProtocol_ResponseHasError(t *testing.T) {
-	data := SerializeResponse(nil, ErrShuttingDown)
+	data, err := SerializeResponse(nil, ErrShuttingDown)
+	assert.Nil(t, err)
 	assert.Greater(t, len(data), 0)
 	resp, err := deserializeResponse(data)
 	assert.NoError(t, err)

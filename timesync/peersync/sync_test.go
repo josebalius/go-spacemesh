@@ -61,7 +61,8 @@ func TestSyncGetOffset(t *testing.T) {
 	}
 	respBuf, err := types.InterfaceToBytes(resp)
 	require.NoError(t, err)
-	payload := server.SerializeResponse(respBuf, nil)
+	payload, err := server.SerializeResponse(respBuf, nil)
+	require.NoError(t, err)
 	receive := make(chan service.DirectMessage, len(peers))
 
 	t.Run("Success", func(t *testing.T) {
@@ -163,7 +164,8 @@ func TestSyncTerminateOnError(t *testing.T) {
 				}
 				respBuf, err := types.InterfaceToBytes(resp)
 				assert.NoError(t, err)
-				payload := server.SerializeResponse(respBuf, nil)
+				payload, err := server.SerializeResponse(respBuf, nil)
+				assert.NoError(t, err)
 
 				receive <- (*directMessage)(&service.DataMsgWrapper{
 					ReqID:   msg.ReqID,

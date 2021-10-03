@@ -282,7 +282,14 @@ func (p *MessageServer) handleRequestMessage(ctx context.Context, msg Message, r
 
 	logger.With().Debug("handle request", log.Uint32("p2p_msg_type", req.MsgType))
 	data, err := reqHandler(ctx, msg)
-	payload := SerializeResponse(data, err)
+	payload, err := SerializeResponse(data, err)
+	if err != nil {
+		logger.With().Error("failed to serialize response",
+			log.Uint64("p2p_request_id", req.ReqID),
+			log.String("protocol", p.name),
+			log.Uint32("p2p_msg_type", req.MsgType))
+		return
+	}
 
 	resp := &service.DataMsgWrapper{MsgType: req.MsgType, ReqID: req.ReqID, Payload: payload}
 	if sendErr := p.network.SendWrappedMessage(ctx, msg.Sender(), p.name, resp); sendErr != nil {

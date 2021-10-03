@@ -306,7 +306,6 @@ func (c *FormattedConnection) Send(ctx context.Context, m []byte) error {
 	case c.messages <- msgToSend{m, reqID, peerID}:
 		return nil
 	case <-c.stopSending:
-		fmt.Println("herex")
 		return ErrClosed
 	default:
 		c.networker.publishClosingConnection(ConnectionWithErr{c, ErrQueueFull}) //
